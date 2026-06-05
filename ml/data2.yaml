@@ -1,0 +1,8 @@
+path: ../datasets/tcg_vision
+train: images/train
+val: images/val
+
+names:
+  0: hand
+  1: card
+  2: deck

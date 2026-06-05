@@ -1,0 +1,13 @@
+train: ../datasets/tcg_vision/images/train
+val: ../datasets/tcg_vision/images/val
+test: ../datasets/tcg_vision/images/test
+
+nc: 3
+names: ['card', 'deck', 'hand']
+
+roboflow:
+  workspace: muhamads-workspace-euji3
+  project: manual-sleught
+  version: 2
+  license: MIT
+  url: https://universe.roboflow.com/muhamads-workspace-euji3/manual-sleught/dataset/2
