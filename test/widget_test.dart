@@ -1,3 +1,4 @@
+import 'package:anti_sleught_hand_tcg/presentation/app.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import '../lib/main.dart';

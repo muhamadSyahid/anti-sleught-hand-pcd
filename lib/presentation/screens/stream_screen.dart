@@ -110,7 +110,7 @@ class _StreamScreenState extends State<StreamScreen>
       if (cameras.isEmpty) return;
       final ctrl = CameraController(
         cameras.first,
-        ResolutionPreset.medium,
+        ResolutionPreset.low,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
@@ -429,17 +429,18 @@ class _StreamScreenState extends State<StreamScreen>
                           fit: StackFit.expand,
                           children: [
                             CameraPreview(_controller!),
-                            if (_detections.isNotEmpty || _handLandmarks != null)
+                            if (_detections.isNotEmpty ||
+                                _handLandmarks != null)
                               CustomPaint(
-          painter: DetectionOverlayPainter(
-            detections: _detections,
-            handLandmarks: _handLandmarks,
-            modelInputW: _modelW,
-            modelInputH: _modelH,
-            dealingLabel: _currentLabel,
-          ),
-          size: Size.infinite,
-        ),
+                                painter: DetectionOverlayPainter(
+                                  detections: _detections,
+                                  handLandmarks: _handLandmarks,
+                                  modelInputW: _modelW,
+                                  modelInputH: _modelH,
+                                  dealingLabel: _currentLabel,
+                                ),
+                                size: Size.infinite,
+                              ),
                           ],
                         ),
                       if (!ready)
@@ -537,10 +538,11 @@ class _StreamScreenState extends State<StreamScreen>
                                   shape: BoxShape.circle,
                                   boxShadow: [
                                     BoxShadow(
-                                      color: (_streaming
-                                              ? const Color(0xFFFF6B6B)
-                                              : const Color(0xFF56E39F))
-                                          .withOpacity(0.4),
+                                      color:
+                                          (_streaming
+                                                  ? const Color(0xFFFF6B6B)
+                                                  : const Color(0xFF56E39F))
+                                              .withOpacity(0.4),
                                       blurRadius: 24,
                                       spreadRadius: 2,
                                     ),
@@ -559,9 +561,7 @@ class _StreamScreenState extends State<StreamScreen>
                               const SizedBox(height: 8),
                               Text(
                                 _streaming ? 'Stop' : 'Start',
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .labelLarge
+                                style: Theme.of(context).textTheme.labelLarge
                                     ?.copyWith(color: Colors.white70),
                               ),
                             ],
@@ -710,18 +710,16 @@ class _InfoTile extends StatelessWidget {
         children: [
           Text(
             title,
-            style: Theme.of(context)
-                .textTheme
-                .labelSmall
-                ?.copyWith(color: Colors.white54),
+            style: Theme.of(
+              context,
+            ).textTheme.labelSmall?.copyWith(color: Colors.white54),
           ),
           const SizedBox(height: 4),
           Text(
             value,
-            style: Theme.of(context)
-                .textTheme
-                .bodySmall
-                ?.copyWith(fontWeight: FontWeight.w700),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w700),
           ),
         ],
       ),

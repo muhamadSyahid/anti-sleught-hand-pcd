@@ -43,7 +43,8 @@ class HiveService {
   }
 
   static List<Map<String, dynamic>> _getList() {
-    return List<Map<String, dynamic>>.from(_b.get('list', defaultValue: []));
+    final raw = _b.get('list', defaultValue: []) as List;
+    return raw.map((e) => Map<String, dynamic>.from(e as Map)).toList();
   }
 
   static Map<String, dynamic> _toMap(DetectionCapture c) => {

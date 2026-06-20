@@ -22,17 +22,25 @@ import 'plane_data.dart';
 class VisionPipeline {
   Interpreter? _yoloInterpreter;
   Interpreter? _poseInterpreter;
-  List<String> _labels = const ['hand', 'card', 'deck'];
+  List<String> _labels = const ['card', 'deck', 'hand'];
 
   int _yoloW = 640;
   int _yoloH = 640;
 
+  // Dimensions of the actual source frame (post-rotation, pre-resize) that
+  // was last fed into YOLO. Detection boxes are rescaled into this space
+  // before being returned, so the overlay painter can scale them onto the
+  // camera preview using the *source frame's* aspect ratio rather than the
+  // model's square 640x640 input — which is what was causing misaligned
+  // boxes whenever the source frame wasn't already square.
+  double _lastSourceW = 640;
+  double _lastSourceH = 640;
+
   String modelStatus = 'Not initialised';
   String poseStatus = 'Not initialised';
 
-  Float32List? _yoloInputBuf;
-  Float32List? _poseInputBuf;
-  Float32List? _yoloOutputBuf;
+  bool _yoloBusy = false;
+  bool _poseBusy = false;
 
   Future<AnalysisResult> analyzeImage(img.Image image) async {
     final notes = <String>[];
@@ -55,8 +63,8 @@ class VisionPipeline {
       detections: detections,
       handLandmarks: landmarks,
       processedImagePath: null,
-      modelInputW: _yoloW.toDouble(),
-      modelInputH: _yoloH.toDouble(),
+      modelInputW: _lastSourceW,
+      modelInputH: _lastSourceH,
     );
   }
 
@@ -66,17 +74,18 @@ class VisionPipeline {
   }) async {
     final notes = <String>[];
 
-    final detections = await _runYoloOnCameraCopy(
-      copy,
-      notes,
-      rotationQuarterTurns: rotationQuarterTurns,
-    );
+    // Use the simple, proven YUV->Image->resize path for both YOLO and hand
+    // landmark instead of the separate fast float32 conversion path. This
+    // trades a bit of speed for correctness while we confirm whether the
+    // fast path's rotation/stride math was producing garbage input.
+    var fullImage = yuvCopyToImage(copy);
+    if (rotationQuarterTurns != 0) {
+      fullImage = img.copyRotate(fullImage, angle: rotationQuarterTurns * 90);
+    }
+
+    final detections = await _runYoloOnImage(fullImage, notes);
     HandLandmarks? landmarks;
     if (detections.isNotEmpty) {
-      var fullImage = yuvCopyToImage(copy);
-      if (rotationQuarterTurns != 0) {
-        fullImage = img.copyRotate(fullImage, angle: rotationQuarterTurns * 90);
-      }
       landmarks = await _runHandLandmarkOnImage(fullImage, notes);
     } else {
       notes.add('No detections — skipping hand landmark');
@@ -94,8 +103,8 @@ class VisionPipeline {
       detections: detections,
       handLandmarks: landmarks,
       processedImagePath: null,
-      modelInputW: _yoloW.toDouble(),
-      modelInputH: _yoloH.toDouble(),
+      modelInputW: _lastSourceW,
+      modelInputH: _lastSourceH,
     );
   }
 
@@ -293,7 +302,6 @@ class VisionPipeline {
         final shape = interp.getInputTensor(0).shape;
         _yoloH = shape[1];
         _yoloW = shape[2];
-        _yoloInputBuf = Float32List(_yoloW * _yoloH * 3);
         modelStatus = 'YOLOv8 loaded ($_yoloW×$_yoloH)';
       },
       onError: (e) => modelStatus = 'YOLOv8 missing: $e',
@@ -302,7 +310,6 @@ class VisionPipeline {
     _poseInterpreter = await _loadInterpreter(
       assetPath: 'assets/models/hand_landmark.tflite',
       onLoaded: (_) {
-        _poseInputBuf = Float32List(224 * 224 * 3);
         poseStatus = 'Hand pose loaded';
       },
       onError: (e) => poseStatus = 'Hand pose missing: $e',
@@ -323,6 +330,10 @@ class VisionPipeline {
         opts.addDelegate(XNNPackDelegate());
       } catch (_) {}
       final interp = await Interpreter.fromAsset(assetPath, options: opts);
+      // Some delegates (GPU/XNNPack) require tensors to be explicitly
+      // (re)allocated before the first invoke(), otherwise run() can throw
+      // "Bad state: failed precondition" on the very first call.
+      interp.allocateTensors();
       onLoaded(interp);
       return interp;
     } catch (_) {}
@@ -333,6 +344,7 @@ class VisionPipeline {
         opts.addDelegate(XNNPackDelegate());
       } catch (_) {}
       final interp = await Interpreter.fromAsset(assetPath, options: opts);
+      interp.allocateTensors();
       onLoaded(interp);
       return interp;
     } catch (_) {}
@@ -340,12 +352,14 @@ class VisionPipeline {
     try {
       final opts = InterpreterOptions()..threads = 4;
       final interp = await Interpreter.fromAsset(assetPath, options: opts);
+      interp.allocateTensors();
       onLoaded(interp);
       return interp;
     } catch (_) {}
 
     try {
       final interp = await Interpreter.fromAsset(assetPath);
+      interp.allocateTensors();
       onLoaded(interp);
       return interp;
     } catch (e) {
@@ -386,8 +400,8 @@ class VisionPipeline {
       detections: detections,
       handLandmarks: landmarks,
       processedImagePath: processedPath,
-      modelInputW: _yoloW.toDouble(),
-      modelInputH: _yoloH.toDouble(),
+      modelInputW: _lastSourceW,
+      modelInputH: _lastSourceH,
     );
   }
 
@@ -444,7 +458,22 @@ class VisionPipeline {
       return const [];
     }
 
+    // If a previous frame's inference is still running, skip this one
+    // instead of letting two calls race on the same interpreter/tensors.
+    if (_yoloBusy) {
+      notes.add('YOLO skipped — previous inference still running');
+      return const [];
+    }
+    _yoloBusy = true;
+
     try {
+      // Remember the *source* frame's dimensions (before the square
+      // resize). The model always sees a stretched 640x640 image, but the
+      // camera preview shows the original aspect ratio — boxes need to be
+      // un-stretched back into this space so they line up on screen.
+      _lastSourceW = image.width.toDouble();
+      _lastSourceH = image.height.toDouble();
+
       final resized = img.copyResize(
         image,
         width: _yoloW,
@@ -452,23 +481,60 @@ class VisionPipeline {
         interpolation: img.Interpolation.linear,
       );
 
-      final input = _yoloInputBuf ??= Float32List(_yoloW * _yoloH * 3);
-      var o = 0;
-      for (int y = 0; y < _yoloH; y++) {
-        for (int x = 0; x < _yoloW; x++) {
-          final p = resized.getPixel(x, y);
-          input[o++] = p.r / 255.0;
-          input[o++] = p.g / 255.0;
-          input[o++] = p.b / 255.0;
-        }
-      }
+      // Build a genuine nested [1, H, W, 3] list (not a flat typed buffer
+      // reshaped after the fact). tflite_flutter's native marshalling can
+      // silently produce all-zero output for some plugin/device
+      // combinations when fed a reshaped Float32List instead of real
+      // nested Dart lists, even though it doesn't throw.
+      final input = List.generate(
+        1,
+        (_) => List.generate(
+          _yoloH,
+          (y) => List.generate(_yoloW, (x) {
+            final p = resized.getPixel(x, y);
+            return [p.r / 255.0, p.g / 255.0, p.b / 255.0];
+          }),
+        ),
+      );
 
-      return _runYoloOnInputBuffer(input, interp, notes);
+      final detections = _runYoloOnNestedInput(input, interp, notes);
+      return _rescaleDetectionsToSource(detections);
     } catch (e, st) {
       notes.add('YOLO error: $e');
       debugPrint('YOLO error: $e\n$st');
       return const [];
+    } finally {
+      _yoloBusy = false;
     }
+  }
+
+  /// Rescales detection boxes from the model's square 640x640 input space
+  /// back into the original (non-square) source frame's pixel space. The
+  /// resize into the model was a plain stretch (not a letterbox), so the
+  /// inverse is just two independent linear scale factors — one for X, one
+  /// for Y.
+  List<VisionDetection> _rescaleDetectionsToSource(
+    List<VisionDetection> detections,
+  ) {
+    if (detections.isEmpty) return detections;
+    final scaleX = _lastSourceW / _yoloW;
+    final scaleY = _lastSourceH / _yoloH;
+    if (scaleX == 1.0 && scaleY == 1.0) return detections;
+
+    return detections.map((d) {
+      final box = d.box;
+      final rescaledBox = Rect.fromLTWH(
+        box.left * scaleX,
+        box.top * scaleY,
+        box.width * scaleX,
+        box.height * scaleY,
+      );
+      return VisionDetection(
+        label: d.label,
+        confidence: d.confidence,
+        box: rescaledBox,
+      );
+    }).toList();
   }
 
   Future<List<VisionDetection>> _runYoloOnCameraCopy(
@@ -482,30 +548,61 @@ class VisionPipeline {
       return const [];
     }
 
+    if (_yoloBusy) {
+      notes.add('YOLO skipped — previous inference still running');
+      return const [];
+    }
+    _yoloBusy = true;
+
     try {
-      final input = _yoloInputBuf ??= Float32List(_yoloW * _yoloH * 3);
-      _yuvCopyToFloat32(
-        copy,
-        input,
-        _yoloW,
-        _yoloH,
-        rotationQuarterTurns: rotationQuarterTurns,
+      // Convert the camera frame to an img.Image first (proven-correct
+      // path, shared with the hand-landmark code) rather than writing
+      // straight into a flat float buffer with custom rotation math.
+      var fullImage = yuvCopyToImage(copy);
+      if (rotationQuarterTurns != 0) {
+        fullImage = img.copyRotate(fullImage, angle: rotationQuarterTurns * 90);
+      }
+      final resized = img.copyResize(
+        fullImage,
+        width: _yoloW,
+        height: _yoloH,
+        interpolation: img.Interpolation.linear,
       );
-      return _runYoloOnInputBuffer(input, interp, notes);
+
+      final input = List.generate(
+        1,
+        (_) => List.generate(
+          _yoloH,
+          (y) => List.generate(_yoloW, (x) {
+            final p = resized.getPixel(x, y);
+            return [p.r / 255.0, p.g / 255.0, p.b / 255.0];
+          }),
+        ),
+      );
+
+      return _runYoloOnNestedInput(input, interp, notes);
     } catch (e, st) {
       notes.add('YOLO error: $e');
       debugPrint('YOLO error: $e\n$st');
       return const [];
+    } finally {
+      _yoloBusy = false;
     }
   }
 
-  List<VisionDetection> _runYoloOnInputBuffer(
-    Float32List input,
+  /// Runs inference using genuine nested Dart lists for both input and
+  /// output, matching the layout `interp.run()` expects natively. This
+  /// mirrors the proven-working implementation rather than relying on
+  /// `Float32List.reshape()`, which produced silent all-zero output on
+  /// some devices despite running without throwing.
+  List<VisionDetection> _runYoloOnNestedInput(
+    List<dynamic> input,
     Interpreter interp,
     List<String> notes,
   ) {
     final outShape = interp.getOutputTensor(0).shape;
-    notes.add('YOLO out shape: $outShape');
+    final inShape = interp.getInputTensor(0).shape;
+    notes.add('YOLO in shape: $inShape, out shape: $outShape');
 
     if (outShape.length != 3) {
       notes.add('Unsupported output shape');
@@ -528,13 +625,10 @@ class VisionPipeline {
 
     final boxCount = boxesFirst ? dim1 : dim2;
     final featCount = boxesFirst ? dim2 : dim1;
-    final totalLen = boxCount * featCount;
 
-    var output = _yoloOutputBuf;
-    if (output == null || output.length != totalLen) {
-      output = Float32List(totalLen);
-      _yoloOutputBuf = output;
-    }
+    final output = boxesFirst
+        ? [List.generate(boxCount, (_) => List<double>.filled(featCount, 0.0))]
+        : [List.generate(featCount, (_) => List<double>.filled(boxCount, 0.0))];
 
     interp.run(input, output);
 
@@ -543,9 +637,9 @@ class VisionPipeline {
 
     double featAt(int i, int f) {
       if (boxesFirst) {
-        return output![i * featCount + f];
+        return (output[0][i][f] as num).toDouble();
       } else {
-        return output![f * boxCount + i];
+        return (output[0][f][i] as num).toDouble();
       }
     }
 
@@ -648,33 +742,47 @@ class VisionPipeline {
     final interp = _poseInterpreter;
     if (interp == null) return null;
 
+    if (_poseBusy) {
+      notes.add('Hand landmark skipped — previous inference still running');
+      return null;
+    }
+    _poseBusy = true;
+
     try {
       const sz = 224;
       final resized = img.copyResize(image, width: sz, height: sz);
 
-      final flat = _poseInputBuf ??= Float32List(sz * sz * 3);
-      var o = 0;
-      for (int y = 0; y < sz; y++) {
-        for (int x = 0; x < sz; x++) {
-          final p = resized.getPixel(x, y);
-          flat[o++] = p.r / 255.0;
-          flat[o++] = p.g / 255.0;
-          flat[o++] = p.b / 255.0;
-        }
-      }
+      // Genuine nested [1, sz, sz, 3] list, same reasoning as the YOLO
+      // input above — avoids relying on Float32List.reshape().
+      final input = List.generate(
+        1,
+        (_) => List.generate(
+          sz,
+          (y) => List.generate(sz, (x) {
+            final p = resized.getPixel(x, y);
+            return [p.r / 255.0, p.g / 255.0, p.b / 255.0];
+          }),
+        ),
+      );
 
-      final output = Float32List(63);
-      interp.run(flat, output);
+      final poseOutShape = interp.getOutputTensor(0).shape;
+      final flatOutLen = poseOutShape.fold<int>(1, (a, b) => a * b);
+      final output = [List<double>.filled(flatOutLen, 0.0)];
 
+      interp.run(input, output);
+
+      final flatOut = output[0];
       final points = List.generate(
         21,
-        (i) => Offset(output[i * 3], output[i * 3 + 1]),
+        (i) => Offset(flatOut[i * 3], flatOut[i * 3 + 1]),
       );
       notes.add('Hand landmarks: 21 pts');
       return HandLandmarks(points);
     } catch (e) {
       notes.add('Hand landmark error: $e');
       return null;
+    } finally {
+      _poseBusy = false;
     }
   }
 
@@ -714,10 +822,14 @@ class VisionPipeline {
     notes.add('Card rel pos in deck: ${relPos.toStringAsFixed(3)}');
 
     if (landmarks != null) {
-      final wristY = landmarks.points[0].dy * _yoloH;
-      final palmBaseY = landmarks.points[9].dy * _yoloH;
-      final thumbTipY = landmarks.points[4].dy * _yoloH;
-      final indexTipY = landmarks.points[8].dy * _yoloH;
+      // Landmark points are normalised 0-1 against the source image that
+      // was fed into the pose model (see _runHandLandmarkOnImage), which is
+      // the same source-frame space the boxes above are now in — so scale
+      // by _lastSourceH, not the model's square input height.
+      final wristY = landmarks.points[0].dy * _lastSourceH;
+      final palmBaseY = landmarks.points[9].dy * _lastSourceH;
+      final thumbTipY = landmarks.points[4].dy * _lastSourceH;
+      final indexTipY = landmarks.points[8].dy * _lastSourceH;
       final gripY = (thumbTipY + indexTipY) / 2;
 
       final gripRelPos = (gripY - deckTop) / deckHeight;

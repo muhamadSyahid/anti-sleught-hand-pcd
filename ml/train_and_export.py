@@ -46,7 +46,7 @@ def ensure_dataset_exists() -> None:
 
 def build_labels_file() -> None:
     ASSETS_MODELS.mkdir(parents=True, exist_ok=True)
-    OUTPUT_LABELS.write_text("hand\ncard\ndeck\n", encoding="utf-8")
+    OUTPUT_LABELS.write_text("card\ndeck\nhand\n", encoding="utf-8")
 
 
 def run_test_evaluation(model_path: Path) -> None:

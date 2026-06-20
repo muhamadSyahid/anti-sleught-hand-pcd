@@ -32,4 +32,4 @@ const labelColors = {
   'deck': Color(0xFFFFC857),
 };
 
-const confThreshold = 0.10;
+const confThreshold = 0.5;
