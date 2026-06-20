@@ -38,6 +38,7 @@ dependencies:
   path_provider: ^2.1.5
   share_plus: ^10.1.4
   tflite_flutter: ^0.12.1
+  hive: ^2.2.3
 
 dev_dependencies:
 

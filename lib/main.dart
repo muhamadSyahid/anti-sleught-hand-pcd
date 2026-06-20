@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:hive/hive.dart';
 import 'package:image/image.dart' as img;
 import 'package:opencv_dart/opencv.dart' as cv;
 import 'package:path_provider/path_provider.dart';
@@ -86,6 +88,7 @@ Future<void> sendAnomalyNotification(DealingLabel label) async {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initNotifications();
+  await _HiveService.init();
   runApp(const AntiSleughtHandApp());
 }
 
@@ -179,6 +182,80 @@ class DetectionCapture {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Hive persistence service
+// ─────────────────────────────────────────────────────────────
+
+class _HiveService {
+  static const _boxName = 'captures';
+  static Box? _box;
+
+  static Future<void> init() async {
+    final dir = await getApplicationDocumentsDirectory();
+    Hive.init(dir.path);
+    _box = await Hive.openBox(_boxName);
+  }
+
+  static Box get _b {
+    if (_box == null) throw StateError('Hive not initialised');
+    return _box!;
+  }
+
+  static Future<void> addCapture(DetectionCapture capture) async {
+    try {
+      final list = _getList();
+      list.add(_toMap(capture));
+      await _b.put('list', list);
+    } catch (_) {}
+  }
+
+  static List<DetectionCapture> getCaptures() {
+    return _getList().map(_fromMap).toList();
+  }
+
+  static Future<void> deleteCapture(DetectionCapture capture) async {
+    try {
+      final list = _getList();
+      list.removeWhere(
+        (m) =>
+            m['timestamp'] == capture.timestamp.millisecondsSinceEpoch &&
+            m['rawImagePath'] == capture.rawImagePath,
+      );
+      await _b.put('list', list);
+    } catch (_) {}
+  }
+
+  static List<Map<String, dynamic>> _getList() {
+    return List<Map<String, dynamic>>.from(_b.get('list', defaultValue: []));
+  }
+
+  static Map<String, dynamic> _toMap(DetectionCapture c) => {
+        'label': c.label.index,
+        'timestamp': c.timestamp.millisecondsSinceEpoch,
+        'rawImagePath': c.rawImagePath,
+        'processedImagePath': c.processedImagePath,
+        'confidence': c.confidence,
+        'notes': c.notes,
+      };
+
+  static DetectionCapture _fromMap(Map<String, dynamic> m) =>
+      DetectionCapture(
+        label: DealingLabel.values[m['label'] as int],
+        timestamp:
+            DateTime.fromMillisecondsSinceEpoch(m['timestamp'] as int),
+        rawImagePath: m['rawImagePath'] as String,
+        processedImagePath: m['processedImagePath'] as String?,
+        confidence: (m['confidence'] as num).toDouble(),
+        notes: List<String>.from(m['notes'] as List),
+    );
+  }
+
+class _PlaneData {
+  const _PlaneData({required this.bytes, required this.stride});
+  final Uint8List bytes;
+  final int stride;
+}
+
+// ─────────────────────────────────────────────────────────────
 // MediaPipe hand skeleton connections
 // ─────────────────────────────────────────────────────────────
 
@@ -222,6 +299,136 @@ class VisionPipeline {
   int _yoloH = 640;
 
   String modelStatus = 'Not initialised';
+
+  /// Analyse a decoded [img.Image] directly (no file I/O).
+  Future<AnalysisResult> analyzeImage(img.Image image) async {
+    final notes = <String>[];
+    final detections = await _runYoloOnImage(image, notes);
+    HandLandmarks? landmarks;
+    if (detections.isNotEmpty) {
+      landmarks = await _runHandLandmarkOnImage(image, notes);
+    } else {
+      notes.add('No detections — skipping hand landmark');
+      landmarks = null;
+    }
+    final label = _classifyDeal(detections, landmarks, notes);
+    final confidence = detections.isEmpty
+        ? 0.0
+        : detections.map((d) => d.confidence).reduce((a, b) => a > b ? a : b);
+    return AnalysisResult(
+      dealingLabel: label,
+      confidence: confidence,
+      notes: notes,
+      detections: detections,
+      handLandmarks: landmarks,
+      processedImagePath: null,
+      modelInputW: _yoloW.toDouble(),
+      modelInputH: _yoloH.toDouble(),
+    );
+  }
+
+  /// Analyse a [CameraImage] from the live camera stream.
+  Future<AnalysisResult> analyzeCameraImage(CameraImage cameraImage) async {
+    final image = _cameraImageToImage(cameraImage);
+    if (image == null) {
+      return AnalysisResult(
+        dealingLabel: DealingLabel.unknown,
+        confidence: 0.0,
+        notes: ['Failed to decode camera frame'],
+        detections: [],
+        handLandmarks: null,
+        processedImagePath: null,
+        modelInputW: _yoloW.toDouble(),
+        modelInputH: _yoloH.toDouble(),
+      );
+    }
+    return analyzeImage(image);
+  }
+
+  /// Converts a [CameraImage] (YUV420 or BGRA8888) to [img.Image].
+  static img.Image? _cameraImageToImage(CameraImage image) {
+    final w = image.width;
+    final h = image.height;
+    final result = img.Image(width: w, height: h);
+    final planes = image.planes;
+
+    if (image.format.group == ImageFormatGroup.bgra8888) {
+      _fillFromBgra(result, planes[0].bytes, planes[0].bytesPerRow);
+      return result;
+    }
+
+    if (image.format.group == ImageFormatGroup.yuv420) {
+      final pd = [
+        _PlaneData(bytes: planes[0].bytes, stride: planes[0].bytesPerRow),
+        _PlaneData(bytes: planes[1].bytes, stride: planes[1].bytesPerRow),
+        if (planes.length > 2)
+          _PlaneData(bytes: planes[2].bytes, stride: planes[2].bytesPerRow),
+      ];
+      _fillFromYuv(result, pd, w, h);
+      return result;
+    }
+
+    return null;
+  }
+
+  /// Same conversion as [_cameraImageToImage] but from our safe copy.
+  static img.Image _yuvCopyToImage(_CameraImageCopy copy) {
+    final w = copy.width;
+    final h = copy.height;
+    final result = img.Image(width: w, height: h);
+
+    if (copy.format == ImageFormatGroup.bgra8888) {
+      _fillFromBgra(result, copy.planes[0], w * 4);
+      return result;
+    }
+
+    final planes = [
+      _PlaneData(bytes: copy.planes[0], stride: w),
+      _PlaneData(bytes: copy.planes[1], stride: w >> 1),
+      if (copy.planes.length > 2)
+        _PlaneData(bytes: copy.planes[2], stride: w >> 1),
+    ];
+    _fillFromYuv(result, planes, w, h);
+    return result;
+  }
+
+  static void _fillFromBgra(img.Image dst, Uint8List bytes, int stride) {
+    final w = dst.width;
+    final h = dst.height;
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        final i = y * stride + x * 4;
+        dst.setPixelRgba(x, y, bytes[i + 2], bytes[i + 1], bytes[i], 255);
+      }
+    }
+  }
+
+  static void _fillFromYuv(
+    img.Image dst,
+    List<_PlaneData> planes,
+    int w,
+    int h,
+  ) {
+    final yStride = planes[0].stride;
+    final uStride = planes[1].stride;
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        final yVal = planes[0].bytes[y * yStride + x];
+        final uvx = x >> 1;
+        final uvy = y >> 1;
+        final uvi = uvy * uStride + uvx;
+        final uVal = planes[1].bytes[uvi] - 128;
+        final vVal = planes[2].bytes[uvi] - 128;
+        dst.setPixelRgba(
+          x, y,
+          (yVal + 1.402 * vVal).clamp(0, 255).round(),
+          (yVal - 0.344 * uVal - 0.714 * vVal).clamp(0, 255).round(),
+          (yVal + 1.772 * uVal).clamp(0, 255).round(),
+          255,
+        );
+      }
+    }
+  }
   String poseStatus = 'Not initialised';
 
   Future<void> initialize() async {
@@ -238,30 +445,72 @@ class VisionPipeline {
       _labels = const ['card', 'deck', 'hand'];
     }
 
-    // YOLOv8 TFLite
-    try {
-      _yoloInterpreter = await Interpreter.fromAsset(
-        'assets/models/yolov8_tcg.tflite',
-      );
-      final shape = _yoloInterpreter!.getInputTensor(0).shape;
-      // shape is typically [1, H, W, 3]
-      _yoloH = shape[1];
-      _yoloW = shape[2];
-      modelStatus = 'YOLOv8 loaded ($_yoloW×$_yoloH)';
-    } catch (e) {
-      _yoloInterpreter = null;
-      modelStatus = 'YOLOv8 missing: $e';
-    }
+    // YOLOv8 TFLite with hardware acceleration
+    _yoloInterpreter = await _loadInterpreter(
+      assetPath: 'assets/models/yolov8_tcg.tflite',
+      onLoaded: (interp) {
+        final shape = interp.getInputTensor(0).shape;
+        _yoloH = shape[1];
+        _yoloW = shape[2];
+        modelStatus = 'YOLOv8 loaded ($_yoloW×$_yoloH)';
+      },
+      onError: (e) => modelStatus = 'YOLOv8 missing: $e',
+    );
 
-    // MediaPipe hand landmark
+    // MediaPipe hand landmark with hardware acceleration
+    _poseInterpreter = await _loadInterpreter(
+      assetPath: 'assets/models/hand_landmark.tflite',
+      onLoaded: (_) => poseStatus = 'Hand pose loaded',
+      onError: (e) => poseStatus = 'Hand pose missing: $e',
+    );
+  }
+
+  Future<Interpreter?> _loadInterpreter({
+    required String assetPath,
+    required void Function(Interpreter) onLoaded,
+    required void Function(Object) onError,
+  }) async {
+    // Attempt 1: GPU delegate + XNNPack + multi-thread
     try {
-      _poseInterpreter = await Interpreter.fromAsset(
-        'assets/models/hand_landmark.tflite',
-      );
-      poseStatus = 'Hand pose loaded';
+      final opts = InterpreterOptions()..threads = 4;
+      try {
+        opts.addDelegate(GpuDelegateV2());
+      } catch (_) {}
+      try {
+        opts.addDelegate(XNNPackDelegate());
+      } catch (_) {}
+      final interp = await Interpreter.fromAsset(assetPath, options: opts);
+      onLoaded(interp);
+      return interp;
+    } catch (_) {}
+
+    // Attempt 2: XNNPack + multi-thread (no GPU)
+    try {
+      final opts = InterpreterOptions()..threads = 4;
+      try {
+        opts.addDelegate(XNNPackDelegate());
+      } catch (_) {}
+      final interp = await Interpreter.fromAsset(assetPath, options: opts);
+      onLoaded(interp);
+      return interp;
+    } catch (_) {}
+
+    // Attempt 3: multi-thread CPU only
+    try {
+      final opts = InterpreterOptions()..threads = 4;
+      final interp = await Interpreter.fromAsset(assetPath, options: opts);
+      onLoaded(interp);
+      return interp;
+    } catch (_) {}
+
+    // Attempt 4: plain (no options)
+    try {
+      final interp = await Interpreter.fromAsset(assetPath);
+      onLoaded(interp);
+      return interp;
     } catch (e) {
-      _poseInterpreter = null;
-      poseStatus = 'Hand pose missing: $e';
+      onError(e);
+      return null;
     }
   }
 
@@ -348,6 +597,22 @@ class VisionPipeline {
     String imagePath,
     List<String> notes,
   ) async {
+    try {
+      final imageBytes = await File(imagePath).readAsBytes();
+      final decoded = img.decodeImage(imageBytes);
+      if (decoded == null) return const [];
+      return _runYoloOnImage(decoded, notes);
+    } catch (e, st) {
+      notes.add('YOLO error: $e');
+      debugPrint('YOLO error: $e\n$st');
+      return const [];
+    }
+  }
+
+  Future<List<VisionDetection>> _runYoloOnImage(
+    img.Image image,
+    List<String> notes,
+  ) async {
     final interp = _yoloInterpreter;
     if (interp == null) {
       notes.add('YOLO skipped — no model');
@@ -355,13 +620,9 @@ class VisionPipeline {
     }
 
     try {
-      final imageBytes = await File(imagePath).readAsBytes();
-      final decoded = img.decodeImage(imageBytes);
-      if (decoded == null) return const [];
-
       // Resize to model input size
       final resized = img.copyResize(
-        decoded,
+        image,
         width: _yoloW,
         height: _yoloH,
         interpolation: img.Interpolation.linear,
@@ -539,16 +800,27 @@ class VisionPipeline {
     String imagePath,
     List<String> notes,
   ) async {
-    final interp = _poseInterpreter;
-    if (interp == null) return null;
-
     try {
       final imageBytes = await File(imagePath).readAsBytes();
       final decoded = img.decodeImage(imageBytes);
       if (decoded == null) return null;
+      return _runHandLandmarkOnImage(decoded, notes);
+    } catch (e) {
+      notes.add('Hand landmark error: $e');
+      return null;
+    }
+  }
 
+  Future<HandLandmarks?> _runHandLandmarkOnImage(
+    img.Image image,
+    List<String> notes,
+  ) async {
+    final interp = _poseInterpreter;
+    if (interp == null) return null;
+
+    try {
       const sz = 224;
-      final resized = img.copyResize(decoded, width: sz, height: sz);
+      final resized = img.copyResize(image, width: sz, height: sz);
 
       final input = List.generate(
         1,
@@ -937,6 +1209,23 @@ class LandingScreen extends StatelessWidget {
                       ),
                       child: const Text('Start monitoring'),
                     ),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        minimumSize: const Size.fromHeight(48),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        side: const BorderSide(color: Colors.white24),
+                      ),
+                      onPressed: () => Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => const HistoryScreen(),
+                        ),
+                      ),
+                      icon: const Icon(Icons.history_rounded, size: 18),
+                      label: const Text('History'),
+                    ),
                     const SizedBox(height: 16),
                     Text(
                       'Bounding boxes and hand skeleton render live. A push notification fires on every anomaly detected.',
@@ -956,6 +1245,21 @@ class LandingScreen extends StatelessWidget {
   }
 }
 
+// Holds a safe copy of a CameraImage frame so the platform buffer can be
+// recycled without losing the pixel data.
+class _CameraImageCopy {
+  _CameraImageCopy({
+    required this.width,
+    required this.height,
+    required this.format,
+    required this.planes,
+  });
+  final int width;
+  final int height;
+  final ImageFormatGroup format;
+  final List<Uint8List> planes;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Stream screen
 // ─────────────────────────────────────────────────────────────
@@ -971,10 +1275,15 @@ class _StreamScreenState extends State<StreamScreen> {
   final VisionPipeline _pipeline = VisionPipeline();
   CameraController? _controller;
   Future<void>? _initFuture;
+
+  // Live camera stream — raw frame bytes copied in the callback so the
+  // platform buffer can be recycled immediately.
+  // Analysis processes the latest frame when idle
   Timer? _analysisTimer;
+  bool _analysisBusy = false;
+  _CameraImageCopy? _pendingImage;
 
   bool _streaming = false;
-  bool _working = false;
 
   List<VisionDetection> _detections = [];
   HandLandmarks? _handLandmarks;
@@ -1005,7 +1314,9 @@ class _StreamScreenState extends State<StreamScreen> {
 
   @override
   void dispose() {
+    _controller?.stopImageStream();
     _analysisTimer?.cancel();
+    _pendingImage = null;
     _controller?.dispose();
     super.dispose();
   }
@@ -1048,17 +1359,24 @@ class _StreamScreenState extends State<StreamScreen> {
     if (_initFuture != null) await _initFuture;
     if (!mounted) return;
     setState(() => _streaming = true);
-    // Use the real detector pipeline here. The worker isolate currently
-    // returns empty detections, so it cannot drive the overlay.
+
+    // Listen to the live camera preview stream. The callback copies raw
+    // bytes so the platform buffer can be recycled immediately.
+    await _controller!.startImageStream(_onCameraImage);
+
+    // Poll for new frames every 50ms after analysis finishes.
     _analysisTimer?.cancel();
-    _analysisTimer = Timer.periodic(const Duration(milliseconds: 700), (_) {
-      _tick();
-    });
+    _analysisTimer = Timer.periodic(
+      const Duration(milliseconds: 50),
+      (_) => _processFrame(),
+    );
   }
 
   void _stopStreaming() {
+    _controller?.stopImageStream();
     _analysisTimer?.cancel();
     _analysisTimer = null;
+    _pendingImage = null;
     _labelHistory.clear();
     _posHistory.clear();
     if (!mounted) return;
@@ -1076,15 +1394,29 @@ class _StreamScreenState extends State<StreamScreen> {
     );
   }
 
-  Future<void> _tick() async {
-    if (!_streaming || _working) return;
-    final ctrl = _controller;
-    if (ctrl == null || !ctrl.value.isInitialized) return;
+  /// Called by the camera plugin for every preview frame.  We copy the raw
+  /// byte planes so the native buffer can be recycled straight away, then the
+  /// analysis loop picks it up when it is ready.
+  void _onCameraImage(CameraImage image) {
+    if (_analysisBusy || !_streaming) return;
+    _pendingImage = _CameraImageCopy(
+      width: image.width,
+      height: image.height,
+      format: image.format.group,
+      planes: image.planes.map((p) => Uint8List.fromList(p.bytes)).toList(),
+    );
+  }
 
-    _working = true;
+  Future<void> _processFrame() async {
+    if (!_streaming || _analysisBusy || _pendingImage == null) return;
+    final imgCopy = _pendingImage!;
+    _pendingImage = null;
+    _analysisBusy = true;
+
     try {
-      final XFile raw = await ctrl.takePicture();
-      final result = await _pipeline.analyzeImagePath(raw.path);
+      final image = VisionPipeline._yuvCopyToImage(imgCopy);
+
+      final result = await _pipeline.analyzeImage(image);
 
       if (!mounted) return;
 
@@ -1117,28 +1449,35 @@ class _StreamScreenState extends State<StreamScreen> {
 
         final ts = DateTime.now().millisecondsSinceEpoch.toString();
         final rawPath = '${dir.path}${Platform.pathSeparator}anomaly_$ts.jpg';
-        await File(raw.path).copy(rawPath);
+        await File(rawPath).writeAsBytes(img.encodeJpg(image), flush: true);
 
         String? procPath;
-        if (result.processedImagePath != null) {
-          procPath = '${dir.path}${Platform.pathSeparator}anomaly_${ts}_cv.png';
-          await File(result.processedImagePath!).copy(procPath);
-        }
+        try {
+          final maskPath = await _pipeline._buildOpenCvMask(
+            rawPath, result.notes,
+          );
+          if (maskPath != null) {
+            procPath =
+                '${dir.path}${Platform.pathSeparator}anomaly_${ts}_cv.png';
+            await File(maskPath).copy(procPath);
+          }
+        } catch (_) {}
+
+        final capture = DetectionCapture(
+          label: smoothedLabel,
+          timestamp: DateTime.now(),
+          rawImagePath: rawPath,
+          processedImagePath: procPath,
+          confidence: result.confidence,
+          notes: result.notes,
+        );
 
         if (mounted) {
           setState(() {
-            _captures.add(
-              DetectionCapture(
-                label: smoothedLabel,
-                timestamp: DateTime.now(),
-                rawImagePath: rawPath,
-                processedImagePath: procPath,
-                confidence: result.confidence,
-                notes: result.notes,
-              ),
-            );
+            _captures.add(capture);
           });
         }
+        await _HiveService.addCapture(capture);
 
         // Debounced notification
         final now = DateTime.now();
@@ -1164,18 +1503,15 @@ class _StreamScreenState extends State<StreamScreen> {
       }
 
       // Cleanup temp files
-      try {
-        await File(raw.path).delete();
-      } catch (_) {}
       if (result.processedImagePath != null && !result.dealingLabel.isAnomaly) {
         try {
           await File(result.processedImagePath!).delete();
         } catch (_) {}
       }
     } catch (e) {
-      debugPrint('Tick error: $e');
+      debugPrint('Process error: $e');
     } finally {
-      _working = false;
+      _analysisBusy = false;
     }
   }
 
@@ -1777,6 +2113,196 @@ class ResultScreen extends StatelessWidget {
                       ),
                     ],
                   ),
+                );
+              },
+            ),
+     );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// History screen
+// ─────────────────────────────────────────────────────────────
+
+class HistoryScreen extends StatefulWidget {
+  const HistoryScreen({super.key});
+
+  @override
+  State<HistoryScreen> createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends State<HistoryScreen> {
+  List<DetectionCapture> _captures = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  void _load() {
+    setState(() {
+      _captures = _HiveService.getCaptures();
+    });
+  }
+
+  Future<void> _delete(int index) async {
+    final c = _captures[index];
+    try {
+      await File(c.rawImagePath).delete();
+    } catch (_) {}
+    if (c.processedImagePath != null) {
+      try {
+        await File(c.processedImagePath!).delete();
+      } catch (_) {}
+    }
+    await _HiveService.deleteCapture(c);
+    _load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          _captures.isEmpty ? 'History' : 'History (${_captures.length})',
+        ),
+      ),
+      body: _captures.isEmpty
+          ? const Center(
+              child: Text(
+                'No captures in history.',
+                style: TextStyle(color: Colors.white54),
+              ),
+            )
+          : ListView.separated(
+              padding: const EdgeInsets.all(14),
+              itemCount: _captures.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 12),
+              itemBuilder: (context, i) {
+                final c = _captures[i];
+                return Stack(
+                  children: [
+                    Container(
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF10233A),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: Colors.white10),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          ClipRRect(
+                            borderRadius: const BorderRadius.vertical(
+                              top: Radius.circular(18),
+                            ),
+                            child: Image.file(
+                              File(c.rawImagePath),
+                              height: 200,
+                              width: double.infinity,
+                              fit: BoxFit.cover,
+                            ),
+                          ),
+                          if (c.processedImagePath != null)
+                            Padding(
+                              padding:
+                                  const EdgeInsets.fromLTRB(12, 12, 12, 0),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(12),
+                                child: Image.file(
+                                  File(c.processedImagePath!),
+                                  height: 160,
+                                  width: double.infinity,
+                                  fit: BoxFit.cover,
+                                ),
+                              ),
+                            ),
+                          Padding(
+                            padding: const EdgeInsets.all(14),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 10,
+                                        vertical: 5,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color:
+                                            c.label.color.withOpacity(0.15),
+                                        borderRadius:
+                                            BorderRadius.circular(999),
+                                        border: Border.all(
+                                          color:
+                                              c.label.color.withOpacity(0.4),
+                                        ),
+                                      ),
+                                      child: Text(
+                                        c.label.title,
+                                        style: TextStyle(
+                                          color: c.label.color,
+                                          fontWeight: FontWeight.w700,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Text(
+                                        c.timestamp.toLocal().toString(),
+                                        style: const TextStyle(
+                                          color: Colors.white38,
+                                          fontSize: 11,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  'Confidence: ${(c.confidence * 100).toStringAsFixed(1)}%',
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  c.label.subtitle,
+                                  style: const TextStyle(
+                                    color: Colors.white54,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Positioned(
+                      bottom: 14,
+                      right: 14,
+                      child: GestureDetector(
+                        onTap: () => _delete(i),
+                        child: Container(
+                          width: 36,
+                          height: 36,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFFF6B6B).withOpacity(0.9),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons.delete_outline_rounded,
+                            size: 18,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 );
               },
             ),
